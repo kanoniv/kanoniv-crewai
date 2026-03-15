@@ -14,8 +14,12 @@ from kanoniv_agent_auth import (
     verify_invocation,
 )
 
-from crewai.tools.base_tool import BaseTool
-from pydantic import Field
+try:
+    from crewai.tools.base_tool import BaseTool
+    from pydantic import Field
+    HAS_CREWAI = True
+except ImportError:
+    HAS_CREWAI = False
 
 
 class DelegatedAgent:
@@ -31,11 +35,13 @@ class DelegatedAgent:
         keypair: AgentKeyPair,
         delegation: Delegation,
         root_identity: AgentIdentity,
+        crew: "DelegatedCrew | None" = None,
     ):
         self.name = name
         self.keypair = keypair
         self.delegation = delegation
         self.root_identity = root_identity
+        self.crew = crew
         self.history: list[dict] = []
 
     @property
@@ -59,11 +65,20 @@ class DelegatedAgent:
         Returns (invoker_did, root_did, chain, depth).
         Raises ValueError if delegation doesn't allow it.
         """
+        if self.crew and self.crew.is_revoked(self):
+            raise ValueError(f"Agent '{self.name}' delegation has been revoked")
         args = args or {}
         invocation = Invocation.create(
             self.keypair, action, json.dumps(args), self.delegation
         )
-        return verify_invocation(invocation, self.identity, self.root_identity)
+        result = verify_invocation(invocation, self.identity, self.root_identity)
+        self.history.append({
+            "action": action,
+            "chain": result[2],
+            "depth": result[3],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        return result
 
     def __repr__(self) -> str:
         return f"DelegatedAgent(name='{self.name}', did='{self.did}')"
@@ -127,7 +142,7 @@ class DelegatedCrew:
         delegation = Delegation.create_root(
             self.root_keypair, keypair.identity().did, json.dumps(caveats)
         )
-        agent = DelegatedAgent(name, keypair, delegation, self.root_identity)
+        agent = DelegatedAgent(name, keypair, delegation, self.root_identity, crew=self)
         self.agents[name] = agent
         return agent
 
@@ -149,7 +164,7 @@ class DelegatedCrew:
             from_agent.keypair, keypair.identity().did,
             json.dumps(caveats), from_agent.delegation
         )
-        agent = DelegatedAgent(name, keypair, delegation, self.root_identity)
+        agent = DelegatedAgent(name, keypair, delegation, self.root_identity, crew=self)
         self.agents[name] = agent
         return agent
 
@@ -197,14 +212,8 @@ class DelegatedCrew:
             if "resource" in kwargs:
                 check_args["resource"] = kwargs["resource"]
 
-            # Verify delegation
-            result = agent.verify_action(action, check_args)
-            agent.history.append({
-                "action": action,
-                "chain": result[2],
-                "depth": result[3],
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            # Verify delegation (also logs to agent.history)
+            agent.verify_action(action, check_args)
 
             return tool_func(*args, **kwargs)
 
@@ -218,6 +227,15 @@ class DelegatedCrew:
                 entries.append({"agent": agent.name, "did": agent.did, **entry})
         entries.sort(key=lambda e: e["timestamp"])
         return entries
+
+
+if not HAS_CREWAI:
+    # Provide a stub so the module can be imported without crewai installed
+    class BaseTool:  # type: ignore
+        pass
+
+    class Field:  # type: ignore
+        def __init__(self, **kwargs): pass
 
 
 class DelegatedTool(BaseTool):
